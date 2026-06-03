@@ -1,0 +1,41 @@
+# =============================================================================
+#  Hermes Agent config (mounted at /root/.hermes/config.yaml)
+#  Points Hermes at the LOCAL Ollama as an OpenAI-compatible custom endpoint.
+#
+#  >>> The 64k line is not optional <<<
+#  Hermes REJECTS any model offering <64,000 tokens of context at startup,
+#  because its system prompt + tool schemas + working state need the room.
+#  That is why the Ollama service runs with q8_0 KV-cache + flash attention:
+#  it lets llama3.1:8b hold a 64k window inside the VRAM budget. Setting a
+#  smaller number here will make Hermes refuse to start.
+# =============================================================================
+
+model:
+  default: "llama3.1:8b-instruct-q8_0"
+  provider: custom
+  base_url: "http://ollama:11434/v1"
+  context_length: 64000          # Hermes hard minimum — keep >= 64000
+
+# Auxiliary tasks (summarization/compression) reuse the same local model so we
+# don't load a second LLM into VRAM. Its context must be >= the main model's.
+auxiliary:
+  compression:
+    model: "llama3.1:8b-instruct-q8_0"
+    base_url: "http://ollama:11434/v1"
+    context_length: 64000
+
+# Run tool/code execution inside Docker isolation rather than on the host.
+terminal:
+  backend: docker
+
+# Memory, learned skills and session state persist under /root/.hermes
+# (bind-mounted to ${DATA_ROOT}/hermes), so they survive restarts and are
+# captured by the Restic backup.
+
+# --- Optional: messaging gateway --------------------------------------------
+# Uncomment and supply tokens via the compose `environment:` block to let
+# Hermes take commands from Telegram/Discord/Slack/Signal.
+# gateway:
+#   telegram:
+#     enabled: true
+#     allowlist: ["<your-telegram-user-id>"]

@@ -1,0 +1,70 @@
+# =============================================================================
+#  meltano.yml — enterprise ingestion into /data/vault/raw/
+#
+#  Pattern: Singer EXTRACTORS (taps) -> target-jsonl, one stream per file under
+#  /data/vault/raw/<source>/. JSONL is the structured staging format the
+#  Librarian reads and turns into markdown wiki pages. Each tap is a separate
+#  job so you can schedule/retry them independently and keep memory tiny.
+#
+#  Secrets come from env (see compose). NEVER hard-code tokens here.
+# =============================================================================
+version: 1
+default_environment: prod
+project_id: ai-stack-ingestion
+
+environments:
+  - name: prod
+
+plugins:
+  extractors:
+    - name: tap-github
+      variant: meltanolabs
+      pip_url: git+https://github.com/MeltanoLabs/tap-github.git
+      config:
+        repositories: ["your-org/your-repo"]   # edit per project
+        # Pulls issues, PRs, commits, comments. Auth via TAP_GITHUB_AUTH_TOKEN.
+      select:
+        - "issues.*"
+        - "pull_requests.*"
+        - "commits.*"
+
+    - name: tap-jira
+      variant: meltanolabs
+      pip_url: git+https://github.com/MeltanoLabs/tap-jira.git
+      # Auth via TAP_JIRA_* env. Pulls issues, comments, projects.
+
+    - name: tap-slack
+      variant: menderesi
+      pip_url: git+https://github.com/Menderes-i/tap-slack.git
+      # Read-only conversation history. Auth via TAP_SLACK_TOKEN.
+
+    # Confluence + Google Drive: pick maintained Singer taps for your tenancy.
+    # Confluence pages export cleanly to JSON; Drive via tap-google-drive.
+    - name: tap-confluence
+      namespace: tap_confluence
+      pip_url: tap-confluence
+    - name: tap-google-drive
+      namespace: tap_google_drive
+      pip_url: tap-google-drive
+
+  loaders:
+    - name: target-jsonl
+      variant: andyh1203
+      pip_url: target-jsonl
+      config:
+        destination_path: /data/vault/raw    # <- the isolated staging directory
+
+  # Optional: dbt or a tiny normalizer can post-process JSONL -> per-project
+  # markdown before the Librarian runs. The Librarian also handles raw JSONL.
+
+jobs:
+  - name: ingest-github
+    tasks: ["tap-github target-jsonl"]
+  - name: ingest-jira
+    tasks: ["tap-jira target-jsonl"]
+  - name: ingest-slack
+    tasks: ["tap-slack target-jsonl"]
+  - name: ingest-confluence
+    tasks: ["tap-confluence target-jsonl"]
+  - name: ingest-drive
+    tasks: ["tap-google-drive target-jsonl"]
