@@ -1,0 +1,5 @@
+.env
+data/
+odysseus/
+**/__pycache__/
+tmp/
