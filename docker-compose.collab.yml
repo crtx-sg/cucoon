@@ -1,0 +1,34 @@
+# =============================================================================
+#  COLLAB OVERLAY — team chat context (Slack)
+#    (repurposed: M365 moved to docker-compose.m365.yml; this is now Slack-only)
+#
+#  Standard bring-up component. Read-only Slack channel/thread context.
+#   * mcp-slack — Slack MCP (community, maintained), SSE.
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # --- Slack MCP (community, maintained): channel history / threads on request -
+  #     The reference @modelcontextprotocol/server-slack is ARCHIVED; this is the
+  #     current maintained server. Token env names changed across versions —
+  #     verify against the image's README (XOXP bot token vs browser XOXC/XOXD).
+  mcp-slack:
+    image: ghcr.io/korotovsky/slack-mcp-server:latest
+    container_name: mcp-slack
+    restart: unless-stopped
+    networks: [ai-internal]
+    environment:
+      SLACK_MCP_XOXP_TOKEN: "${SLACK_BOT_TOKEN}"   # read-only bot token
+      SLACK_MCP_PORT: "13080"
+      SLACK_MCP_HOST: "0.0.0.0"
+      SLACK_MCP_SSE_API_KEY: "${SLACK_MCP_SSE_API_KEY}"
+    # SSE endpoint -> http://mcp-slack:13080/sse
+    deploy:
+      resources:
+        limits:
+          memory: 384m

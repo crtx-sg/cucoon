@@ -1,0 +1,79 @@
+# =============================================================================
+#  ERP OVERLAY — SAP Business One ONLY  (ON-DEMAND module)
+#
+#  This overlay is NOT part of the default bring-up. Include it only when SAP B1
+#  access is required:
+#    docker compose \
+#      -f docker-compose.yml \
+#      -f docker-compose.enterprise.yml \
+#      -f docker-compose.erp.yml up -d
+#  (Bitbucket now lives in docker-compose.enterprise.yml. Greenlight Guru has its
+#   own on-demand overlay, docker-compose.glg.yml.)
+#
+#  Provides:
+#   * sap-b1-mcp     — read-only SAP Business One Service Layer exposed over MCP
+#                      (custom thin server; the SL has no MCP of its own).
+#   * sap-b1-webhook — receiver for SAP B1 *event hooks*. SAP B1's Service Layer
+#                      has NO native webhooks, so events are pushed by the B1
+#                      Integration Framework (B1if) Event Sender via an HTTP
+#                      outbound call to this endpoint (see notes for the B1if side).
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # ===========================================================================
+  #  SAP BUSINESS ONE — read-only MCP over the Service Layer (OData v4)
+  #  Custom thin server (sap-b1/server.py). Only ever issues GET => read-only.
+  # ===========================================================================
+  sap-b1-mcp:
+    build:
+      context: ./sap-b1
+    image: sap-b1-bridge:local
+    container_name: sap-b1-mcp
+    restart: unless-stopped
+    networks: [ai-internal]
+    command: ["python", "server.py"]
+    environment:
+      SAP_B1_SERVICE_LAYER_URL: "${SAP_B1_SERVICE_LAYER_URL}"  # https://sap:50000/b1s/v1
+      SAP_B1_COMPANY_DB: "${SAP_B1_COMPANY_DB}"
+      SAP_B1_USER: "${SAP_B1_USER}"                            # use a READ-ONLY SAP user
+      SAP_B1_PASSWORD: "${SAP_B1_PASSWORD}"
+      SAP_B1_VERIFY_SSL: "${SAP_B1_VERIFY_SSL:-false}"         # SL certs are often self-signed
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+    # MCP endpoint -> http://sap-b1-mcp:8000/mcp  (streamable HTTP)
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+
+  # ===========================================================================
+  #  SAP B1 EVENT-HOOK RECEIVER
+  #  B1if's Event Sender -> HttpCall atom POSTs B1 events here. We persist them
+  #  into the vault and (optionally) ping ntfy so Hermes can react in near-real-time.
+  # ===========================================================================
+  sap-b1-webhook:
+    image: sap-b1-bridge:local        # same image as sap-b1-mcp
+    container_name: sap-b1-webhook
+    restart: unless-stopped
+    networks: [ai-internal]
+    command: ["uvicorn", "webhook:app", "--host", "0.0.0.0", "--port", "8800"]
+    environment:
+      SAP_B1_WEBHOOK_SECRET: "${SAP_B1_WEBHOOK_SECRET}"   # shared secret B1if must send
+      VAULT_EVENTS_DIR: "/data/vault/raw/sap/events"
+      NTFY_URL: "http://ntfy:80/sap-b1"                   # optional agent trigger
+    volumes:
+      - ${DATA_ROOT}/vault:/data/vault
+    # Receives at http://sap-b1-webhook:8800/b1if/event
+    # Expose to the SAP host over the tailnet (add a serve.json entry) — never publicly.
+    depends_on:
+      - sap-b1-mcp
+    deploy:
+      resources:
+        limits:
+          memory: 256m

@@ -1,0 +1,76 @@
+# =============================================================================
+#  M365 OVERLAY — Microsoft 365 (Outlook + Teams + SharePoint)
+#    (renamed from docker-compose.collab.yml; collab.yml is now Slack-only)
+#
+#  Standard bring-up component.
+#   * mcp-m365     — ONE Graph-based MCP covering Outlook + Teams + SharePoint
+#                    (Softeria), org-mode + read-only.
+#   * m365-hooks   — Microsoft Graph change-notification receiver + subscription
+#                    manager (creates & auto-renews). NEEDS PUBLIC HTTPS ingress
+#                    (Microsoft's cloud calls it) -> Tailscale FUNNEL, this path only.
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # ===========================================================================
+  #  MICROSOFT 365 — Outlook + Teams + SharePoint over Graph (read-only)
+  #  App-only (client-credentials) auth with an Azure AD app registration whose
+  #  Graph APPLICATION permissions are read-only and admin-consented.
+  #  Verify exact env names + HTTP flags against the image's docs/deployment.md.
+  # ===========================================================================
+  mcp-m365:
+    image: ghcr.io/softeria/ms-365-mcp-server:latest
+    container_name: mcp-m365
+    restart: unless-stopped
+    networks: [ai-internal]
+    command: ["--http", "8000", "--org-mode", "--read-only"]
+    environment:
+      MS365_MCP_TENANT_ID: "${MS365_TENANT_ID}"
+      MS365_MCP_CLIENT_ID: "${MS365_CLIENT_ID}"
+      MS365_MCP_CLIENT_SECRET: "${MS365_CLIENT_SECRET}"
+    # MCP endpoint -> http://mcp-m365:8000  (verify transport/path in deployment.md)
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # ===========================================================================
+  #  M365 GRAPH HOOKS — change-notification receiver + subscription manager
+  #  IMPORTANT: notificationUrl must be PUBLIC HTTPS. Expose ONLY this service's
+  #  /graph/notifications path via `tailscale funnel` (see notes). clientState +
+  #  the validation handshake are what keep it safe despite being public.
+  # ===========================================================================
+  m365-hooks:
+    build:
+      context: ./m365
+    image: m365-hooks:local
+    container_name: m365-hooks
+    restart: unless-stopped
+    networks: [ai-internal]
+    environment:
+      MS365_TENANT_ID: "${MS365_TENANT_ID}"
+      MS365_CLIENT_ID: "${MS365_CLIENT_ID}"
+      MS365_CLIENT_SECRET: "${MS365_CLIENT_SECRET}"
+      # PUBLIC https URL Graph will POST to (your Tailscale Funnel hostname):
+      GRAPH_NOTIFICATION_URL: "${GRAPH_NOTIFICATION_URL}"
+      # Shared secret echoed back in every notification for verification:
+      GRAPH_CLIENT_STATE: "${GRAPH_CLIENT_STATE}"
+      # JSON list of subscriptions, e.g.
+      # [{"resource":"users/USER_ID/messages","changeType":"created,updated"},
+      #  {"resource":"sites/SITE_ID/lists/LIST_ID","changeType":"updated"}]
+      GRAPH_SUBSCRIPTIONS: "${GRAPH_SUBSCRIPTIONS}"
+      EXPIRATION_MINUTES: "60"
+      VAULT_EVENTS_DIR: "/data/vault/raw/m365/events"
+      NTFY_URL: "http://ntfy:80/m365"
+    volumes:
+      - ${DATA_ROOT}/vault:/data/vault
+    command: ["uvicorn", "hooks:app", "--host", "0.0.0.0", "--port", "8810"]
+    deploy:
+      resources:
+        limits:
+          memory: 256m

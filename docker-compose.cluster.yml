@@ -1,0 +1,44 @@
+# =============================================================================
+#  CLUSTER OVERLAY — multi-node GPU serving via Ray  (OPTIONAL / ADVANCED)
+#
+#  DEFAULT IS SINGLE NODE. You only need this file to span MULTIPLE PHYSICAL
+#  HOSTS. For a single host with multiple GPUs you do NOT need Ray — just set
+#  VLLM_TENSOR_PARALLEL_SIZE and VLLM_GPU_COUNT in .env (vLLM uses multiprocessing).
+#
+#  HOW MULTI-NODE WORKS (vLLM + Ray):
+#   * TENSOR_PARALLEL_SIZE = GPUs per node, PIPELINE_PARALLEL_SIZE = number of nodes
+#     (so TP x PP = total GPUs across the cluster).
+#   * Compose is single-host, so it CANNOT start the worker nodes for you. This
+#     overlay only flips THIS (head) node's vLLM to the Ray backend and exposes
+#     the Ray dashboard. Worker nodes are started on their own hosts with vLLM's
+#     bundled helper:
+#
+#       # On EACH worker host (same image, same model cache path):
+#       bash run_cluster.sh vllm/vllm-openai <HEAD_NODE_IP> --worker /path/to/hf-cache
+#       # On the head host you can also use run_cluster.sh ... --head ...
+#
+#   * All nodes must run the SAME image + model, be on the same LAN, and ideally
+#     have a fast interconnect (InfiniBand/100GbE) for tensor parallelism.
+#
+#  Run (head node), e.g. 2 nodes x 1 GPU -> TP=1, PP=2 in .env:
+#    docker compose <standard -f flags> -f docker-compose.cluster.yml up -d
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # Override the base vllm service to use the Ray distributed backend and to
+  # publish the Ray dashboard. Set TP/PP/GPU_COUNT in .env for your topology.
+  vllm:
+    environment:
+      # Append the Ray backend to whatever VLLM_EXTRA_ARGS already holds.
+      VLLM_EXTRA_ARGS: "--distributed-executor-backend ray ${VLLM_EXTRA_ARGS:-}"
+    ports:
+      - "127.0.0.1:8265:8265"      # Ray dashboard (loopback; surface via tailnet if wanted)
+    # NOTE: a Ray head must be running in/alongside this container and reachable
+    # by the workers. The simplest supported path is vLLM's run_cluster.sh on all
+    # hosts (see header) rather than hand-wiring Ray here.

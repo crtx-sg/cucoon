@@ -1,0 +1,438 @@
+# =============================================================================
+#  PRIVATE LOCAL AI SERVER — unified stack
+#  Host: Ubuntu Server 24.04 LTS | i7-14700 | RTX 4000 Ada (20 GB) | 32 GB DDR5
+#
+#  Design rules enforced here:
+#   * INGRESS  : nothing is published on 0.0.0.0. Tailscale is the ONLY way in.
+#                A few admin ports are bound to 127.0.0.1 (loopback) for local
+#                debugging only — they are NOT reachable from the LAN/internet.
+#   * EGRESS   : left open. SearXNG, Postiz, vLLM/Infinity (model pulls) and
+#                Restic genuinely need outbound internet, so a fully
+#                `internal: true` network is intentionally NOT used.
+#   * STORAGE  : every stateful service bind-mounts under ${DATA_ROOT}. That
+#                single tree is what backup.sh snapshots with Restic.
+#   * RAM      : the box is 1x32 GB SINGLE-CHANNEL. Memory bandwidth — not
+#                capacity — is the scarce resource. Every container has a hard
+#                mem_limit; the LLM is FP8 and resident in VRAM (never spilled to
+#                host RAM), embeddings run on CPU, and vLLM's KV pool is bounded
+#                by --gpu-memory-utilization to protect headroom.
+#
+#  Bring-up:  see init-commands in the accompanying notes (clone Odysseus first).
+# =============================================================================
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+networks:
+  ai-internal:
+    name: ai-internal
+    driver: bridge
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # vLLM — primary LLM serving engine. Fully parameterized; DEFAULTS = SINGLE
+  #   NODE, 1 GPU. Scale up by env only:
+  #     * single host, N GPUs  -> VLLM_TENSOR_PARALLEL_SIZE=N, VLLM_GPU_COUNT=N
+  #     * multi-node (Ray)      -> see docker-compose.cluster.yml + docs §3.2
+  #   VLLM_EXTRA_ARGS is appended verbatim (word-split) for things like Qwen
+  #   YaRN rope-scaling, --distributed-executor-backend ray, --trust-remote-code.
+  # ---------------------------------------------------------------------------
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    ipc: host                            # vLLM needs ample shared memory
+    volumes:
+      - ${DATA_ROOT}/hf-cache:/root/.cache/huggingface
+    environment:
+      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
+      # --- model (configurable: Llama default; Qwen supported — see .env) ------
+      VLLM_MODEL: "${VLLM_MODEL:-RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8}"
+      VLLM_SERVED_NAME: "${VLLM_SERVED_NAME:-llama3.1-8b}"
+      VLLM_MAX_MODEL_LEN: "${VLLM_MAX_MODEL_LEN:-65536}"   # >= Hermes 64k floor
+      # --- parallelism (defaults = single node / single GPU) ------------------
+      VLLM_TENSOR_PARALLEL_SIZE: "${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+      VLLM_PIPELINE_PARALLEL_SIZE: "${VLLM_PIPELINE_PARALLEL_SIZE:-1}"
+      # --- VRAM / cache -------------------------------------------------------
+      VLLM_GPU_MEMORY_UTILIZATION: "${VLLM_GPU_MEMORY_UTILIZATION:-0.82}"
+      VLLM_KV_CACHE_DTYPE: "${VLLM_KV_CACHE_DTYPE:-fp8}"   # fp8 -> 64k fits in budget
+      VLLM_MAX_NUM_SEQS: "${VLLM_MAX_NUM_SEQS:-8}"
+      VLLM_EXTRA_ARGS: "${VLLM_EXTRA_ARGS:-}"
+    # Shell form so VLLM_EXTRA_ARGS word-splits into multiple flags. $$ keeps the
+    # expansion in the CONTAINER shell (not compose). `vllm serve` is the modern
+    # CLI; if your image tag differs, swap for `python3 -m vllm.entrypoints.openai.api_server`.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        vllm serve "$${VLLM_MODEL}"
+        --served-model-name "$${VLLM_SERVED_NAME}"
+        --max-model-len "$${VLLM_MAX_MODEL_LEN}"
+        --tensor-parallel-size "$${VLLM_TENSOR_PARALLEL_SIZE}"
+        --pipeline-parallel-size "$${VLLM_PIPELINE_PARALLEL_SIZE}"
+        --kv-cache-dtype "$${VLLM_KV_CACHE_DTYPE}"
+        --gpu-memory-utilization "$${VLLM_GPU_MEMORY_UTILIZATION}"
+        --max-num-seqs "$${VLLM_MAX_NUM_SEQS}"
+        $${VLLM_EXTRA_ARGS}
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${VLLM_GPU_COUNT:-1}      # bump for single-host multi-GPU
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s                 # first run downloads the model
+
+  # ---------------------------------------------------------------------------
+  # EMBEDDINGS — Infinity serving bge-m3 (OpenAI-compatible).
+  #   Defaults to CPU to preserve VRAM for the LLM's 64k context (the 20-core
+  #   CPU handles bge-m3 fine). Switch --device to cuda only if you downsize the
+  #   LLM context and have headroom. Endpoint: http://embeddings:7997
+  # ---------------------------------------------------------------------------
+  embeddings:
+    image: michaelf34/infinity:latest
+    container_name: embeddings
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    volumes:
+      - ${DATA_ROOT}/hf-cache:/app/.cache/huggingface
+    command: ["v2", "--model-id", "BAAI/bge-m3", "--port", "7997", "--device", "cpu"]
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:7997/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # CHROMADB — vector store that Odysseus REQUIRES for memory/skills
+  #   In Docker, Odysseus connects to chromadb:8000.
+  # ---------------------------------------------------------------------------
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: chromadb
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    volumes:
+      - ${DATA_ROOT}/chromadb:/data
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+      PERSIST_DIRECTORY: "/data"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    healthcheck:
+      # Chroma 1.x exposes /api/v2/heartbeat. If you pin an older 0.5.x image,
+      # change v2 -> v1 below. We use python (always present) instead of curl.
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/api/v2/heartbeat')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # SEARXNG — private meta-search; the web backend for Odysseus
+  #   LOOPBACK-ONLY ingress (127.0.0.1:8080). Never exposed off-box.
+  #   Internal containers reach it at http://searxng:8080.
+  # ---------------------------------------------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    ports:
+      - "127.0.0.1:8080:8080"          # loopback only — host-local debugging
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+      # The image rewrites the placeholder secret_key in settings.yml with this:
+      SEARXNG_SECRET: "${SEARXNG_SECRET}"
+      UWSGI_WORKERS: "4"
+      UWSGI_THREADS: "4"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # POSTGRES — ONE engine, partitioned into two databases (odysseus + postiz).
+  #   init-databases.sh (run once on first boot) creates both DBs + roles.
+  #   Tuned small for a single-channel-RAM host.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    volumes:
+      - ${DATA_ROOT}/postgres:/var/lib/postgresql/data
+      - ./postgres/init-databases.sh:/docker-entrypoint-initdb.d/00-init-databases.sh:ro
+    environment:
+      # Superuser used only for bootstrap; app roles are created by the init script.
+      POSTGRES_USER: "${PG_SUPERUSER}"
+      POSTGRES_PASSWORD: "${PG_SUPERUSER_PASSWORD}"
+      POSTGRES_DB: "postgres"
+      # App credentials consumed by the init script:
+      ODYSSEUS_DB_USER: "${ODYSSEUS_DB_USER}"
+      ODYSSEUS_DB_PASSWORD: "${ODYSSEUS_DB_PASSWORD}"
+      POSTIZ_DB_USER: "${POSTIZ_DB_USER}"
+      POSTIZ_DB_PASSWORD: "${POSTIZ_DB_PASSWORD}"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=256MB"          # conservative for single-channel RAM
+      - "-c"
+      - "effective_cache_size=1GB"
+      - "-c"
+      - "max_connections=80"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "synchronous_commit=on"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_SUPERUSER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # REDIS — dedicated to Postiz's BullMQ-style job queue.
+  #   AOF on so queued/scheduled jobs survive a restart (and are backed up).
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "384mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - ${DATA_ROOT}/redis:/data
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # NTFY — local notification bus Odysseus uses for reminders/task pings.
+  # ---------------------------------------------------------------------------
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    command: ["serve"]
+    environment:
+      NTFY_BASE_URL: "http://ntfy:80"
+      NTFY_BEHIND_PROXY: "true"
+    volumes:
+      - ${DATA_ROOT}/ntfy:/var/lib/ntfy
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  # ---------------------------------------------------------------------------
+  # ODYSSEUS — the workspace / deep-research UI (PewDiePie's self-hosted app).
+  #   No official image yet: built from the cloned repo at ./odysseus.
+  #   Plain HTTP on :7000; TLS is terminated by Tailscale serve (see below).
+  # ---------------------------------------------------------------------------
+  odysseus:
+    build:
+      context: ./odysseus            # `git clone` the repo here first (see notes)
+    image: odysseus:local
+    container_name: odysseus
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    # No public port. Reached over the tailnet via the tailscale service.
+    # ports: ["127.0.0.1:7000:7000"]  # uncomment for host-local debugging only
+    volumes:
+      - ${DATA_ROOT}/odysseus/data:/app/data
+      - ${DATA_ROOT}/odysseus/hf:/root/.cache/huggingface
+    environment:
+      APP_PORT: "7000"
+      AUTH_ENABLED: "true"            # MUST stay true on a networked deployment
+      LOCALHOST_BYPASS: "false"
+      # --- model + search wiring (most provider config is done in-app Settings) -
+      # Point Odysseus at vLLM (OpenAI-compatible). In-app, add an OpenAI-compatible
+      # provider: base_url http://vllm:8000/v1, model "llama3.1-8b".
+      LLM_HOST: "vllm:8000"
+      SEARXNG_INSTANCE: "http://searxng:8080"
+      CHROMADB_HOST: "chromadb"
+      CHROMADB_PORT: "8000"
+      # Embeddings served by the Infinity container (bge-m3), OpenAI-compatible.
+      # Alternatively delete this to use Odysseus's built-in CPU fastembed.
+      EMBEDDING_URL: "http://embeddings:7997"
+      # --- database --------------------------------------------------------------
+      # Shared Postgres. Odysseus is a brand-new release; if its migrations don't
+      # cleanly target Postgres on your build, COMMENT THIS OUT to fall back to
+      # its default SQLite at /app/data/app.db (still captured by Restic).
+      DATABASE_URL: "postgresql://${ODYSSEUS_DB_USER}:${ODYSSEUS_DB_PASSWORD}@postgres:5432/odysseus"
+      # Pre-seed the first admin instead of fishing it out of the logs:
+      ODYSSEUS_ADMIN_USER: "${ODYSSEUS_ADMIN_USER}"
+      ODYSSEUS_ADMIN_PASSWORD: "${ODYSSEUS_ADMIN_PASSWORD}"
+    depends_on:
+      vllm: {condition: service_started}
+      embeddings: {condition: service_started}
+      chromadb: {condition: service_healthy}
+      searxng: {condition: service_started}
+      postgres: {condition: service_healthy}
+      ntfy: {condition: service_started}
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+  # ---------------------------------------------------------------------------
+  # HERMES AGENT — autonomous orchestration daemon (Nous Research).
+  #   Hermes ships no official image; this builds a thin wrapper around the
+  #   official installer and runs the gateway headless. It points at the LOCAL
+  #   vLLM endpoint (OpenAI-compatible). See ./hermes/config.yaml.
+  #
+  #   HARD REQUIREMENT: Hermes rejects any model with <64k context at startup.
+  #   That is why vLLM runs with --max-model-len 65536 (+ fp8 KV cache).
+  #
+  #   If the headless container is fiddly on first run, the officially-supported
+  #   path is to run the installer ON THE HOST (see notes) pointed at
+  #   http://127.0.0.1:8000/v1 over the tailnet — the rest of the stack is
+  #   unaffected either way.
+  # ---------------------------------------------------------------------------
+  hermes:
+    build:
+      context: ./hermes
+    image: hermes-agent:local
+    container_name: hermes
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    volumes:
+      - ${DATA_ROOT}/hermes:/root/.hermes      # config, memory, learned skills
+      - ./hermes/config.yaml:/root/.hermes/config.yaml:ro
+    environment:
+      # Provider auth: vLLM ignores the key, but Hermes wants a non-empty value.
+      OPENAI_API_KEY: "vllm"
+      HERMES_STREAM_READ_TIMEOUT: "1800"       # local big-context safety
+      # Optional messaging gateway tokens (Telegram/Discord/etc.) go here:
+      # TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+    depends_on:
+      vllm: {condition: service_healthy}
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # ---------------------------------------------------------------------------
+  # POSTIZ — social-media scheduling / automation.
+  #   Pinned to v2.11.3 ON PURPOSE: v2.12+ adds a Temporal dependency (an extra
+  #   always-on service + worker) that this single-channel 32 GB box doesn't
+  #   need. Bump it later if you want Temporal-backed workflows.
+  # ---------------------------------------------------------------------------
+  postiz:
+    image: ghcr.io/gitroomhq/postiz-app:v2.11.3
+    container_name: postiz
+    restart: unless-stopped
+    networks: [ai-internal]
+    logging: *default-logging
+    # No public port. Served over the tailnet by the tailscale service on :8443.
+    # ports: ["127.0.0.1:5000:5000"]  # uncomment for host-local debugging only
+    volumes:
+      - ${DATA_ROOT}/postiz/config:/config
+      - ${DATA_ROOT}/postiz/uploads:/uploads
+    environment:
+      # These URLs MUST match how you reach Postiz over the tailnet.
+      # ${TS_HOSTNAME}.${TS_TAILNET} is your MagicDNS name.
+      MAIN_URL: "https://${TS_HOSTNAME}.${TS_TAILNET}:8443"
+      FRONTEND_URL: "https://${TS_HOSTNAME}.${TS_TAILNET}:8443"
+      NEXT_PUBLIC_BACKEND_URL: "https://${TS_HOSTNAME}.${TS_TAILNET}:8443/api"
+      BACKEND_INTERNAL_URL: "http://localhost:3000"
+      JWT_SECRET: "${POSTIZ_JWT_SECRET}"
+      DATABASE_URL: "postgresql://${POSTIZ_DB_USER}:${POSTIZ_DB_PASSWORD}@postgres:5432/postiz"
+      REDIS_URL: "redis://redis:6379"
+      IS_GENERAL: "true"
+      DISABLE_REGISTRATION: "false"     # flip to true after you create your admin
+      RUN_CRON: "true"                  # in-process scheduler (no Temporal on 2.11)
+      STORAGE_PROVIDER: "local"
+      UPLOAD_DIRECTORY: "/uploads"
+      NEXT_PUBLIC_UPLOAD_DIRECTORY: "/uploads"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+  # ---------------------------------------------------------------------------
+  # TAILSCALE — the SOLE ingress. Runs in userspace mode (no TUN/NET_ADMIN) and
+  #   uses `tailscale serve` to TLS-terminate and reverse-proxy to the apps:
+  #     https://<host>.<tailnet>/        -> odysseus:7000
+  #     https://<host>.<tailnet>:8443/   -> postiz:5000
+  #   serve config lives in ./tailscale/serve.json.
+  # ---------------------------------------------------------------------------
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    restart: unless-stopped
+    hostname: "${TS_HOSTNAME}"
+    networks: [ai-internal]
+    logging: *default-logging
+    volumes:
+      - ${DATA_ROOT}/tailscale:/var/lib/tailscale
+      - ./tailscale/serve.json:/config/serve.json:ro
+    environment:
+      TS_AUTHKEY: "${TS_AUTHKEY}"
+      TS_STATE_DIR: "/var/lib/tailscale"
+      TS_USERSPACE: "true"
+      TS_SERVE_CONFIG: "/config/serve.json"
+      TS_EXTRA_ARGS: "--hostname=${TS_HOSTNAME} --accept-dns=true"
+    depends_on:
+      odysseus: {condition: service_started}
+      postiz: {condition: service_started}
+    deploy:
+      resources:
+        limits:
+          memory: 256m

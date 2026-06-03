@@ -1,0 +1,178 @@
+# =============================================================================
+#  ENTERPRISE INTEGRATION LAYER  (overlay on the base stack)
+#
+#  Run together with the base file:
+#    docker compose -f docker-compose.yml -f docker-compose.enterprise.yml up -d
+#
+#  Adds:
+#   * meltano        — lightweight, CRON-DRIVEN ingestion (Jira/Confluence/Slack/
+#                      Drive/GitHub) -> /data/vault/raw/. Ephemeral: nothing
+#                      stays resident, protecting single-channel RAM.
+#   * wiki-viewer    — llmwiki serving the compiled Obsidian-style vault (R/O UI).
+#   * wiki-compiler  — the "Librarian": a headless opencode agent that drives
+#                      llmwiki's MCP tools using LOCAL Ollama. CRON @ 02:00.
+#   * mcp-postgres   — Postgres MCP Pro, RESTRICTED (read-only), native SSE.
+#   * mcp-slack      — Slack MCP (community, maintained), SSE.
+#   * mcp-github     — GitHub's official MCP (read-only + lockdown), exposed over
+#                      SSE via a supergateway wrapper (the binary is stdio-only).
+#
+#  DESIGN NOTES inline. The two "jobs" services have profiles so they DON'T run
+#  continuously — they're invoked by cron via `docker compose run --rm`.
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true            # created by the base docker-compose.yml
+
+services:
+
+  # ===========================================================================
+  #  A. INGESTION — Meltano (Singer taps), cron-driven, ephemeral
+  # ===========================================================================
+  meltano:
+    build:
+      context: ./meltano
+    image: meltano:local
+    container_name: meltano
+    profiles: ["jobs"]          # never auto-starts; `docker compose run` triggers it
+    restart: "no"
+    networks: [ai-internal]
+    volumes:
+      - ./meltano:/project
+      - ${DATA_ROOT}/vault:/data/vault          # writes raw/ into the shared vault
+    working_dir: /project
+    environment:
+      # --- enterprise source credentials (set in .env) -----------------------
+      TAP_GITHUB_AUTH_TOKEN: "${GITHUB_MCP_PAT}"
+      TAP_JIRA_BASE_URL: "${JIRA_BASE_URL}"
+      TAP_JIRA_API_TOKEN: "${JIRA_API_TOKEN}"
+      TAP_JIRA_EMAIL: "${JIRA_EMAIL}"
+      TAP_CONFLUENCE_BASE_URL: "${CONFLUENCE_BASE_URL}"
+      TAP_CONFLUENCE_API_TOKEN: "${CONFLUENCE_API_TOKEN}"
+      TAP_SLACK_TOKEN: "${SLACK_BOT_TOKEN}"
+      # Google Drive uses a service-account JSON mounted via the project dir.
+    deploy:
+      resources:
+        limits:
+          memory: 1g            # a single sync run stays well under this
+
+  # ===========================================================================
+  #  B1. WIKI VIEWER — llmwiki serving the compiled vault (read-only browsing)
+  #      Reached over the tailnet (add a serve.json entry on :9443 if you want).
+  # ===========================================================================
+  wiki-viewer:
+    build:
+      context: ./librarian       # image bundles llmwiki + opencode (see Dockerfile)
+    image: librarian:local
+    container_name: wiki-viewer
+    restart: unless-stopped
+    networks: [ai-internal]
+    volumes:
+      - ${DATA_ROOT}/vault:/data/vault
+    working_dir: /opt/llmwiki
+    # Serves the indexed/compiled vault UI. Verify the exact flag against
+    # `./llmwiki serve --help` for your checkout.
+    command: ["bash", "-lc", "./llmwiki serve /data/vault --host 0.0.0.0 --port 3000"]
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ===========================================================================
+  #  B2. WIKI COMPILER — the "Librarian" agent. CRON @ 02:00 only.
+  #      opencode (MCP client) + local Ollama drive llmwiki's MCP tools to
+  #      dedupe, build [[backlinks]], and log contradictions into /data/vault/wiki.
+  # ===========================================================================
+  wiki-compiler:
+    image: librarian:local       # same build as wiki-viewer
+    container_name: wiki-compiler
+    profiles: ["jobs"]           # invoked by cron, not always-on
+    restart: "no"
+    networks: [ai-internal]
+    volumes:
+      - ${DATA_ROOT}/vault:/data/vault
+      - ./librarian/compile.sh:/opt/compile.sh:ro
+    environment:
+      # Point the agent at the LOCAL model. NOTE: wiki QUALITY is model-bound —
+      # an 8B local model produces a weaker synthesis than a frontier model.
+      # To raise quality on the nightly run only, swap these for a stronger
+      # endpoint (e.g. an Anthropic/OpenAI key) while keeping everything else local.
+      OPENAI_BASE_URL: "http://ollama:11434/v1"
+      OPENAI_API_KEY: "ollama"
+      LIBRARIAN_MODEL: "llama3.1:8b-instruct-q8_0"
+      VAULT_RAW: "/data/vault/raw"
+      VAULT_OUT: "/data/vault/wiki"
+    depends_on:
+      ollama: {condition: service_healthy}
+    command: ["bash", "/opt/compile.sh"]
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+
+  # ===========================================================================
+  #  C. MCP SIDECARS — real-time, READ-ONLY system context for the orchestrators
+  #     All speak SSE on ai-internal. Wire them into Odysseus/Hermes by URL
+  #     (see the MCP wiring snippet in the notes).
+  # ===========================================================================
+
+  # --- Postgres MCP Pro: schema inspection + safe parameterized queries -------
+  #     RESTRICTED access mode + a dedicated read-only DB role = double lockdown.
+  mcp-postgres:
+    image: crystaldba/postgres-mcp:latest
+    container_name: mcp-postgres
+    restart: unless-stopped
+    networks: [ai-internal]
+    command: ["--access-mode=restricted", "--transport=sse"]
+    environment:
+      # Connects as the read-only role created by postgres/mcp-readonly.sql.
+      DATABASE_URI: "postgresql://${MCP_RO_DB_USER}:${MCP_RO_DB_PASSWORD}@postgres:5432/odysseus"
+    # SSE endpoint -> http://mcp-postgres:8000/sse
+    depends_on:
+      postgres: {condition: service_healthy}
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # --- Slack MCP (community, maintained): channel history / threads on request -
+  #     The reference @modelcontextprotocol/server-slack is ARCHIVED; this is the
+  #     current maintained server. Token env names changed across versions —
+  #     verify against the image's README (XOXP bot token vs browser XOXC/XOXD).
+  mcp-slack:
+    image: ghcr.io/korotovsky/slack-mcp-server:latest
+    container_name: mcp-slack
+    restart: unless-stopped
+    networks: [ai-internal]
+    environment:
+      SLACK_MCP_XOXP_TOKEN: "${SLACK_BOT_TOKEN}"   # read-only bot token
+      SLACK_MCP_PORT: "13080"
+      SLACK_MCP_HOST: "0.0.0.0"
+      SLACK_MCP_SSE_API_KEY: "${SLACK_MCP_SSE_API_KEY}"
+    # SSE endpoint -> http://mcp-slack:13080/sse
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+
+  # --- GitHub MCP (official): repos / PRs / commits, READ-ONLY + LOCKDOWN ------
+  #     The official binary is stdio-only, so a supergateway wrapper (built in
+  #     ./mcp-github) re-exposes it as SSE on ai-internal.
+  mcp-github:
+    build:
+      context: ./mcp-github
+    image: mcp-github-sse:local
+    container_name: mcp-github
+    restart: unless-stopped
+    networks: [ai-internal]
+    environment:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_MCP_PAT}"
+      GITHUB_READ_ONLY: "1"                 # no writes, ever
+      GITHUB_LOCKDOWN_MODE: "1"             # don't surface untrusted public content
+      GITHUB_TOOLSETS: "repos,issues,pull_requests"
+    # SSE endpoint -> http://mcp-github:8081/sse
+    deploy:
+      resources:
+        limits:
+          memory: 384m

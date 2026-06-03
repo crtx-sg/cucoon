@@ -1,0 +1,80 @@
+# =============================================================================
+#  GREENLIGHT GURU OVERLAY — medical-device eQMS  (ON-DEMAND module)
+#
+#  This overlay is NOT part of the default bring-up. Include it only when
+#  Greenlight Guru access is required:
+#    docker compose \
+#      -f docker-compose.yml \
+#      -f docker-compose.enterprise.yml \
+#      -f docker-compose.glg.yml up -d
+#
+#  Provides:
+#   * mcp-glg     — read-only REST MCP bridge (GET-only allowlist).
+#   * glg-poller  — "hooks" via polling. GLG exposes REST + API keys but no
+#                   documented webhooks, so we pull -> no public ingress needed
+#                   (a privacy advantage over the M365 Graph hooks).
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # ===========================================================================
+  #  GREENLIGHT GURU — read-only REST MCP (medical-device eQMS)
+  #  Generic GET-only REST bridge: you supply the base URL, API key, and the
+  #  exact resource paths from your GLG API reference (behind their dev portal).
+  # ===========================================================================
+  mcp-glg:
+    build:
+      context: ./glg
+    image: glg-bridge:local
+    container_name: mcp-glg
+    restart: unless-stopped
+    networks: [ai-internal]
+    command: ["python", "server.py"]
+    environment:
+      GLG_API_BASE_URL: "${GLG_API_BASE_URL}"      # e.g. https://api.greenlight.guru/v1 (confirm in your GLG docs)
+      GLG_API_KEY: "${GLG_API_KEY}"
+      GLG_AUTH_HEADER: "${GLG_AUTH_HEADER:-Authorization}"
+      GLG_AUTH_PREFIX: "${GLG_AUTH_PREFIX:-Bearer }"
+      # Comma-separated allowed GET path prefixes (read-only allowlist):
+      GLG_ALLOWED_PATHS: "${GLG_ALLOWED_PATHS:-documents,capas,change-orders,complaints,design-controls,risks}"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+    # MCP endpoint -> http://mcp-glg:8000/mcp
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+
+  # ===========================================================================
+  #  GREENLIGHT GURU HOOKS (polling) — no public ingress required.
+  #  Polls the allowlisted resources for recently-changed records and drops
+  #  events into the vault + pings ntfy so Hermes can react.
+  # ===========================================================================
+  glg-poller:
+    image: glg-bridge:local       # same image as mcp-glg
+    container_name: glg-poller
+    restart: unless-stopped
+    networks: [ai-internal]
+    command: ["python", "poll.py"]
+    environment:
+      GLG_API_BASE_URL: "${GLG_API_BASE_URL}"
+      GLG_API_KEY: "${GLG_API_KEY}"
+      GLG_AUTH_HEADER: "${GLG_AUTH_HEADER:-Authorization}"
+      GLG_AUTH_PREFIX: "${GLG_AUTH_PREFIX:-Bearer }"
+      GLG_ALLOWED_PATHS: "${GLG_ALLOWED_PATHS:-documents,capas,change-orders,complaints,design-controls,risks}"
+      # The query param GLG uses to filter by modified time (set per their API docs):
+      GLG_MODIFIED_PARAM: "${GLG_MODIFIED_PARAM:-updatedAfter}"
+      GLG_POLL_SECONDS: "300"
+      VAULT_EVENTS_DIR: "/data/vault/raw/glg/events"
+      NTFY_URL: "http://ntfy:80/greenlight-guru"
+    volumes:
+      - ${DATA_ROOT}/vault:/data/vault
+    deploy:
+      resources:
+        limits:
+          memory: 256m

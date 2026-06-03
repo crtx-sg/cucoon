@@ -1,0 +1,73 @@
+# =============================================================================
+#  KNOWLEDGEBASE OVERLAY — the LLM wiki (compile + browse)
+#    (split out of the former docker-compose.enterprise.yml)
+#
+#  Standard bring-up component.
+#   * wiki-viewer   — llmwiki serving the compiled Obsidian-style vault (R/O UI).
+#   * wiki-compiler — the "Librarian": a headless opencode agent that drives
+#                     llmwiki's MCP tools using the LOCAL vLLM model. CRON @ 02:00.
+#
+#  Reads/writes /data/vault (raw/ produced by the integration overlay; wiki/
+#  produced here). Depends on vLLM from the base compose.
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # ===========================================================================
+  #  WIKI VIEWER — llmwiki serving the compiled vault (read-only browsing)
+  #      Reached over the tailnet (add a serve.json entry on :9443 if you want).
+  # ===========================================================================
+  wiki-viewer:
+    build:
+      context: ./librarian       # image bundles llmwiki + opencode (see Dockerfile)
+    image: librarian:local
+    container_name: wiki-viewer
+    restart: unless-stopped
+    networks: [ai-internal]
+    volumes:
+      - ${DATA_ROOT}/vault:/data/vault
+    working_dir: /opt/llmwiki
+    # Serves the indexed/compiled vault UI. Verify the exact flag against
+    # `./llmwiki serve --help` for your checkout.
+    command: ["bash", "-lc", "./llmwiki serve /data/vault --host 0.0.0.0 --port 3000"]
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ===========================================================================
+  #  WIKI COMPILER — the "Librarian" agent. CRON @ 02:00 only.
+  #      opencode (MCP client) + local vLLM drive llmwiki's MCP tools to
+  #      dedupe, build [[backlinks]], and log contradictions into /data/vault/wiki.
+  # ===========================================================================
+  wiki-compiler:
+    image: librarian:local       # same build as wiki-viewer
+    container_name: wiki-compiler
+    profiles: ["jobs"]           # invoked by cron, not always-on
+    restart: "no"
+    networks: [ai-internal]
+    volumes:
+      - ${DATA_ROOT}/vault:/data/vault
+      - ./librarian/compile.sh:/opt/compile.sh:ro
+    environment:
+      # Point the agent at the LOCAL model. NOTE: wiki QUALITY is model-bound —
+      # an 8B local model produces a weaker synthesis than a frontier model.
+      # To raise quality on the nightly run only, swap these for a stronger
+      # endpoint (e.g. an Anthropic/OpenAI key) while keeping everything else local.
+      OPENAI_BASE_URL: "http://vllm:8000/v1"
+      OPENAI_API_KEY: "vllm"
+      LIBRARIAN_MODEL: "llama3.1-8b"
+      VAULT_RAW: "/data/vault/raw"
+      VAULT_OUT: "/data/vault/wiki"
+    depends_on:
+      vllm: {condition: service_healthy}
+    command: ["bash", "/opt/compile.sh"]
+    deploy:
+      resources:
+        limits:
+          memory: 3g

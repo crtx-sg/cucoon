@@ -1,0 +1,70 @@
+# =============================================================================
+#  TICKETING OVERLAY — issue/ticket-tracker context (read-only)
+#
+#  Standard bring-up component. A dedicated home for TICKETING-SYSTEM context so
+#  the function is cleanly separated and EXTENSIBLE: add Linear / ServiceNow /
+#  Zendesk / GitHub-Issues MCP sidecars here later without touching other files.
+#
+#  Today: Jira (via sooperset/mcp-atlassian, Jira-scoped + read-only).
+#
+#  NOTE ON INGESTION: the Jira *tap* (bulk pull into the vault) stays in the
+#  shared Meltano project (integration overlay) — Meltano is one ephemeral
+#  container by design, so we don't fragment it per source. This overlay carries
+#  the *live read-only context* function instead.
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # ===========================================================================
+  #  JIRA — read-only MCP context (Cloud or Server/DC).
+  #  sooperset/mcp-atlassian starts JIRA-ONLY when only Jira creds are provided
+  #  (Confluence creds intentionally omitted). --read-only blocks all writes.
+  #  Cloud auth = JIRA_URL + JIRA_USERNAME + JIRA_API_TOKEN.
+  #  Server/DC auth = JIRA_URL + JIRA_PERSONAL_TOKEN (swap the env below).
+  # ===========================================================================
+  mcp-jira:
+    image: ghcr.io/sooperset/mcp-atlassian:latest
+    container_name: mcp-jira
+    restart: unless-stopped
+    networks: [ai-internal]
+    command: ["--transport", "sse", "--port", "9000", "--read-only"]
+    environment:
+      JIRA_URL: "${JIRA_BASE_URL}"          # e.g. https://your-org.atlassian.net
+      JIRA_USERNAME: "${JIRA_EMAIL}"        # Cloud: Atlassian account email
+      JIRA_API_TOKEN: "${JIRA_API_TOKEN}"   # Cloud API token
+      # Server/Data Center instead:
+      # JIRA_PERSONAL_TOKEN: "${JIRA_PERSONAL_TOKEN}"
+      READ_ONLY_MODE: "true"
+    # SSE endpoint -> http://mcp-jira:9000/sse
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+
+  # ---------------------------------------------------------------------------
+  #  EXTENSION SLOTS (uncomment + configure to add more ticketing systems).
+  #  Each is a sibling read-only MCP sidecar; agents see them as separate tools.
+  # ---------------------------------------------------------------------------
+  # mcp-linear:
+  #   image: <linear-mcp-image>
+  #   container_name: mcp-linear
+  #   restart: unless-stopped
+  #   networks: [ai-internal]
+  #   environment:
+  #     LINEAR_API_KEY: "${LINEAR_API_KEY}"
+  #   deploy: { resources: { limits: { memory: 256m } } }
+  #
+  # mcp-servicenow:
+  #   image: <servicenow-mcp-image>
+  #   container_name: mcp-servicenow
+  #   restart: unless-stopped
+  #   networks: [ai-internal]
+  #   environment:
+  #     SERVICENOW_INSTANCE_URL: "${SERVICENOW_INSTANCE_URL}"
+  #     SERVICENOW_TOKEN: "${SERVICENOW_TOKEN}"
+  #   deploy: { resources: { limits: { memory: 256m } } }

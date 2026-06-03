@@ -1,0 +1,71 @@
+# =============================================================================
+#  INTEGRATION OVERLAY — data ingestion + read-only DB context
+#    (split out of the former docker-compose.enterprise.yml)
+#
+#  Standard bring-up component. Run merged with the base + other overlays.
+#
+#  NOTE: the PostgreSQL *database* lives in the BASE compose (docker-compose.yml)
+#  because Odysseus AND Postiz both depend on it — it is shared core infra, not
+#  an integration concern. This overlay adds the data-movement pieces:
+#   * meltano       — Singer-based ingestion -> /data/vault/raw/ (cron, ephemeral).
+#   * mcp-postgres  — read-only (RESTRICTED) MCP context over that shared DB.
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # ===========================================================================
+  #  INGESTION — Meltano (Singer taps), cron-driven, ephemeral
+  # ===========================================================================
+  meltano:
+    build:
+      context: ./meltano
+    image: meltano:local
+    container_name: meltano
+    profiles: ["jobs"]          # never auto-starts; `docker compose run` triggers it
+    restart: "no"
+    networks: [ai-internal]
+    volumes:
+      - ./meltano:/project
+      - ${DATA_ROOT}/vault:/data/vault          # writes raw/ into the shared vault
+    working_dir: /project
+    environment:
+      # --- enterprise source credentials (set in .env) -----------------------
+      TAP_GITHUB_AUTH_TOKEN: "${GITHUB_MCP_PAT}"
+      TAP_JIRA_BASE_URL: "${JIRA_BASE_URL}"
+      TAP_JIRA_API_TOKEN: "${JIRA_API_TOKEN}"
+      TAP_JIRA_EMAIL: "${JIRA_EMAIL}"
+      TAP_CONFLUENCE_BASE_URL: "${CONFLUENCE_BASE_URL}"
+      TAP_CONFLUENCE_API_TOKEN: "${CONFLUENCE_API_TOKEN}"
+      TAP_SLACK_TOKEN: "${SLACK_BOT_TOKEN}"
+      # Google Drive uses a service-account JSON mounted via the project dir.
+    deploy:
+      resources:
+        limits:
+          memory: 1g            # a single sync run stays well under this
+
+  # ===========================================================================
+  #  Postgres MCP Pro: schema inspection + safe parameterized queries
+  #  RESTRICTED access mode + the dedicated read-only DB role = double lockdown.
+  #  (Connects to the postgres DB defined in the base compose.)
+  # ===========================================================================
+  mcp-postgres:
+    image: crystaldba/postgres-mcp:latest
+    container_name: mcp-postgres
+    restart: unless-stopped
+    networks: [ai-internal]
+    command: ["--access-mode=restricted", "--transport=sse"]
+    environment:
+      # Connects as the read-only role created by postgres/mcp-readonly.sql.
+      DATABASE_URI: "postgresql://${MCP_RO_DB_USER}:${MCP_RO_DB_PASSWORD}@postgres:5432/odysseus"
+    # SSE endpoint -> http://mcp-postgres:8000/sse
+    depends_on:
+      postgres: {condition: service_healthy}
+    deploy:
+      resources:
+        limits:
+          memory: 512m

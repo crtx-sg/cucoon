@@ -1,0 +1,27 @@
+{
+  "//": "Tailscale serve config. ${TS_CERT_DOMAIN} is auto-substituted by the",
+  "//2": "container with this node's MagicDNS name. HTTPS uses a Let's Encrypt",
+  "//3": "cert that Tailscale provisions for the tailnet. Result:",
+  "//4": "  https://<host>.<tailnet>/       -> Odysseus (workspace/research)",
+  "//5": "  https://<host>.<tailnet>:8443/  -> Postiz   (social automation)",
+  "TCP": {
+    "443":  { "HTTPS": true },
+    "8443": { "HTTPS": true }
+  },
+  "Web": {
+    "${TS_CERT_DOMAIN}:443": {
+      "Handlers": {
+        "/": { "Proxy": "http://odysseus:7000" }
+      }
+    },
+    "${TS_CERT_DOMAIN}:8443": {
+      "Handlers": {
+        "/": { "Proxy": "http://postiz:5000" }
+      }
+    }
+  },
+  "AllowFunnel": {
+    "${TS_CERT_DOMAIN}:443":  false,
+    "${TS_CERT_DOMAIN}:8443": false
+  }
+}

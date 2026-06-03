@@ -1,0 +1,88 @@
+# =============================================================================
+#  MONITORING OVERLAY — metrics dashboard + live logs (lightweight, private)
+#
+#  Standard bring-up component. Deliberately simple and low-footprint to suit a
+#  single-channel-RAM host:
+#   * beszel        — self-hosted metrics dashboard (history, alerts). UI :8090.
+#   * beszel-agent  — collects host + Docker + GPU stats, feeds the hub.
+#   * dozzle        — live, in-browser tail of every container's logs. UI :8089.
+#
+#  LOGGING: containers already use json-file with rotation (the x-logging anchor
+#  in the base compose: max 10 MB x 3 files), so logs are bounded on disk and
+#  Dozzle streams them live. For long-term searchable retention, add Grafana
+#  Loki + a log driver later (kept out here to stay simple).
+#
+#  All UIs bind to 127.0.0.1 only; surface them over the tailnet via serve.json
+#  if you want remote access. Nothing here is public.
+# =============================================================================
+
+networks:
+  ai-internal:
+    name: ai-internal
+    external: true
+
+services:
+
+  # ===========================================================================
+  #  BESZEL HUB — the dashboard. First run: open the UI, create the admin user,
+  #  "Add system" -> it shows a public KEY; put that in BESZEL_KEY (.env) for the
+  #  agent below, pointing the system at host "beszel-agent:45876".
+  # ===========================================================================
+  beszel:
+    image: henrygd/beszel:latest
+    container_name: beszel
+    restart: unless-stopped
+    networks: [ai-internal]
+    ports:
+      - "127.0.0.1:8090:8090"       # loopback only; expose via Tailscale if wanted
+    volumes:
+      - ${DATA_ROOT}/beszel:/beszel_data
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  # ===========================================================================
+  #  BESZEL AGENT — metrics collector (host + Docker + GPU).
+  #  GPU stats require the agent to see the GPU; we grant it and enable GPU mode.
+  #  (Confirm the exact GPU-enable env against the Beszel agent docs for your tag.)
+  # ===========================================================================
+  beszel-agent:
+    image: henrygd/beszel-agent:latest
+    container_name: beszel-agent
+    restart: unless-stopped
+    networks: [ai-internal]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      LISTEN: "45876"
+      KEY: "${BESZEL_KEY:-}"        # public key shown by the hub when adding a system
+      GPU: "true"                   # enable NVIDIA GPU metrics (via nvidia-smi)
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, utility]
+
+  # ===========================================================================
+  #  DOZZLE — live container log viewer (no storage, near-zero overhead).
+  # ===========================================================================
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: dozzle
+    restart: unless-stopped
+    networks: [ai-internal]
+    ports:
+      - "127.0.0.1:8089:8080"       # loopback only
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+    deploy:
+      resources:
+        limits:
+          memory: 128m

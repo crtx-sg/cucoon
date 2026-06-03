@@ -1,0 +1,52 @@
+# =============================================================================
+#  SearXNG — minimal settings tuned to act as a PRIVATE JSON search API
+#  for Odysseus. Mounted read-only at /etc/searxng/settings.yml.
+#
+#  Key points:
+#   * Inherits all upstream defaults (engines, etc.) via use_default_settings.
+#   * `formats` includes json  -> Odysseus can consume the raw JSON API.
+#   * limiter/bot-detection OFF -> internal programmatic calls aren't throttled
+#     (safe ONLY because this instance is never exposed publicly).
+#   * secret_key is the placeholder the official image rewrites using the
+#     SEARXNG_SECRET env var — keep it as "ultrasecretkey" here.
+# =============================================================================
+
+use_default_settings: true
+
+general:
+  instance_name: "private-ai-search"
+  debug: false
+
+server:
+  bind_address: "0.0.0.0"        # inside the container only; host maps 127.0.0.1
+  port: 8080
+  secret_key: "ultrasecretkey"   # overwritten at boot by ${SEARXNG_SECRET}
+  limiter: false                 # no rate limiting for trusted internal callers
+  public_instance: false
+  image_proxy: true
+  method: "GET"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json                       # <-- REQUIRED so Odysseus can read JSON results
+
+ui:
+  static_use_hash: true
+
+# Trim noisy/slow engines and keep solid general-web + news coverage.
+# Adjust freely; these are sensible defaults for research queries.
+engines:
+  - name: google
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: bing
+    disabled: true               # frequently rate-limits scrapers; off by default
