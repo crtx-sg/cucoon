@@ -16,7 +16,7 @@ relying on the corresponding service (see brief §9).
 - [x] All 22 standard-set services carry a `deploy.resources.limits.memory`.
 - [x] `vllm` carries the GPU reservation (`driver: nvidia`, `count: ${VLLM_GPU_COUNT:-1}`, `capabilities: [gpu]`).
 - [x] Read-only flags present: mcp-github (`GITHUB_READ_ONLY=1`, `GITHUB_LOCKDOWN_MODE=1`), mcp-postgres (`--access-mode=restricted`), mcp-jira (`--read-only` + `READ_ONLY_MODE=true`), mcp-m365 (`--read-only`).
-- [x] Every `${VAR}` referenced in compose / `hermes/config.yaml` / `scripts/backup.sh` is defined in `env.example` (or is a script-local var / runtime-substituted placeholder — see "Non-issues").
+- [x] Every `${VAR}` referenced in compose / `hermes/config.yaml` / `scripts/backup.sh` is defined in `.env.example` (or is a script-local var / runtime-substituted placeholder — see "Non-issues").
 
 ## Open VERIFY items (confirm against current vendor docs)
 
@@ -44,8 +44,8 @@ relying on the corresponding service (see brief §9).
 
 ## Repo-structure note (vs brief §3)
 
-- The variables file is named `env.example` (no leading dot) rather than `.env.example`. Functionally equivalent (both committed; `.gitignore` ignores `.env`). A duplicate copy exists at `tmp/.env.example`. Flagged for your awareness — not changed.
+- The variables file is named `.env.example` per §3. (It was briefly `env.example` with a duplicate at `tmp/.env.example`; renamed via `git mv` and the `tmp/` scratch dir removed. `.gitignore` ignores `.env` but not `.env.example`, so the example is tracked.)
 
 ## Steps that require the GPU host / live credentials (NOT run here)
 
-See brief §7.5. In short: NVIDIA driver + Container Toolkit install, `cp env.example .env` + fill secrets, `git clone` Odysseus, `mkdir ${DATA_ROOT}`, `docker compose build`, `docker compose up -d`, vLLM/embeddings health, Odysseus first-login + vLLM provider, apply `postgres/mcp-readonly.sql`, wire MCP endpoints, M365 Funnel + subscriptions, cron for `nightly.sh`/`backup.sh`, backup + test restore.
+See brief §7.5. In short: NVIDIA driver + Container Toolkit install, `cp .env.example .env` + fill secrets, `git clone` Odysseus, `mkdir ${DATA_ROOT}`, `docker compose build`, `docker compose up -d`, vLLM/embeddings health, Odysseus first-login + vLLM provider, apply `postgres/mcp-readonly.sql`, wire MCP endpoints, M365 Funnel + subscriptions, cron for `nightly.sh`/`backup.sh`, backup + test restore.
