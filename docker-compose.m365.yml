@@ -21,19 +21,25 @@ services:
   #  MICROSOFT 365 — Outlook + Teams + SharePoint over Graph (read-only)
   #  App-only (client-credentials) auth with an Azure AD app registration whose
   #  Graph APPLICATION permissions are read-only and admin-consented.
-  #  Verify exact env names + HTTP flags against the image's docs/deployment.md.
+  #  Softeria ships NO container image; it's an npm package run via npx. We run
+  #  it on a Node base image, pinned for reproducibility, with a persisted npm
+  #  cache so restarts don't re-download. (VERIFY: bump the @x.y.z pin as
+  #  upstream releases; --http <port> serves MCP at /mcp, default port 3000.)
   # ===========================================================================
   mcp-m365:
-    image: ghcr.io/softeria/ms-365-mcp-server:latest
+    image: node:22-bookworm-slim
     container_name: mcp-m365
     restart: unless-stopped
     networks: [ai-internal]
-    command: ["--http", "8000", "--org-mode", "--read-only"]
+    command: ["npx", "-y", "@softeria/ms-365-mcp-server@0.114.0", "--http", "8000", "--org-mode", "--read-only"]
     environment:
+      NPM_CONFIG_CACHE: /npm-cache
       MS365_MCP_TENANT_ID: "${MS365_TENANT_ID}"
       MS365_MCP_CLIENT_ID: "${MS365_CLIENT_ID}"
       MS365_MCP_CLIENT_SECRET: "${MS365_CLIENT_SECRET}"
-    # MCP endpoint -> http://mcp-m365:8000  (verify transport/path in deployment.md)
+    volumes:
+      - ${DATA_ROOT}/m365-mcp-npm:/npm-cache
+    # MCP endpoint -> http://mcp-m365:8000/mcp
     deploy:
       resources:
         limits:
