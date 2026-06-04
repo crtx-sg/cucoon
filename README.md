@@ -85,11 +85,17 @@ done   # paste into .env; also set TS_*, AWS_*, and the connector tokens you use
 **3. Build & run**
 
 ```bash
+docker network create ai-internal   # one-time: overlays share this as an external network
 docker compose build          # builds odysseus, hermes, meltano, librarian, mcp-github, sap-b1, m365, glg
 docker compose up -d
 docker compose ps             # watch healthchecks
 docker compose logs -f vllm   # first run downloads the model (a few minutes)
 ```
+
+> The overlays reference `ai-internal` as `external: true`, so it must exist before the
+> first `up`. Create it once with the command above (idempotent across reboots — the
+> network persists). If you ever fully remove it (`docker network rm ai-internal`),
+> recreate it before bringing the stack back up.
 
 **4. First login**
 

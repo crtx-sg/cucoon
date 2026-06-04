@@ -36,6 +36,10 @@ relying on the corresponding service (see brief §9).
 | 12 | `hermes/Dockerfile` | Hermes installer URL + headless gateway verb (`hermes gateway start --headless`) can change between releases. |
 | 13 | `docker-compose.repo.yml` / general | Postiz pinned at `v2.11.3` to avoid the Temporal dep in v2.12+; confirm env keys if bumping. |
 
+## Required one-time host setup
+
+- **Create the shared network before the first `up`:** `docker network create ai-internal`. The overlays declare it `external: true`, and in the merged standard set that wins over the base's bridge definition, so Compose will **not** auto-create it — `docker compose up -d` fails with *"network ai-internal declared as external, but could not be found"* until it exists. The network persists across reboots; only recreate it if explicitly removed. (Documented in README §3.)
+
 ## Non-issues (checked, intentional)
 
 - `${TS_CERT_DOMAIN}` in `tailscale/serve.json` is auto-substituted by Tailscale at runtime, not from `.env`.
