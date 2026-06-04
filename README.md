@@ -33,6 +33,67 @@ Every enterprise connector is **read-only**. No application UI is exposed to the
 
 ---
 
+## Architecture at a glance
+
+A simplified view of the main components and how they interact (the full diagram is in [`docs/ARCHITECTURE.md §4`](docs/ARCHITECTURE.md)):
+
+```mermaid
+flowchart TB
+    USER([You — on the tailnet])
+    WEB([Public web])
+    ENT([Enterprise systems:<br/>GitHub · Jira · Slack · SAP · M365])
+
+    USER -->|private HTTPS| TS
+
+    subgraph HOST[Cucoon host]
+        TS[Tailscale<br/>sole ingress]
+
+        subgraph AI[Core AI]
+            ODY[Odysseus<br/>workspace + research UI]
+            HER[Hermes<br/>autonomous agent]
+            VLLM[[vLLM<br/>local LLM · GPU]]
+            SRX[SearXNG<br/>meta-search]
+        end
+
+        subgraph DATA[State]
+            PG[(Postgres)]
+            CHR[(ChromaDB<br/>+ embeddings)]
+            VLT[/vault:<br/>raw + wiki/]
+        end
+
+        subgraph KB[Knowledge pipeline · off-hours]
+            MEL[Meltano<br/>ingestion]
+            LIB[Librarian<br/>wiki compiler]
+        end
+
+        MCP[MCP sidecars<br/>read-only bridges]
+    end
+
+    TS --> ODY
+    ODY --> VLLM
+    HER --> VLLM
+    ODY --> SRX
+    ODY --> CHR
+    ODY --> PG
+    SRX --> WEB
+
+    ODY -. read-only .-> MCP
+    HER -. read-only .-> MCP
+    MCP -. GET only .-> ENT
+
+    ENT --> MEL --> VLT
+    LIB --> VLT
+    LIB --> VLLM
+    ODY --> VLT
+```
+
+- **Tailscale** is the only way in — you reach **Odysseus** (and Postiz) over the private tailnet; nothing is published publicly.
+- **Odysseus** (UI) and **Hermes** (agent) both think via the local **vLLM** model, search the web through **SearXNG**, and keep vectors/state in **ChromaDB** + **Postgres**.
+- Live enterprise context comes through the read-only **MCP sidecars** (GET-only / read-scoped creds).
+- Off-hours, **Meltano** pulls enterprise data into the **vault** and the **Librarian** compiles it into an interlinked wiki — feeding knowledge without touching the live path.
+
+---
+
 ## Hardware target
 
 | | |
