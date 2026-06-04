@@ -160,6 +160,53 @@ Tailscale is the only way in; application UIs publish no public ports (a few bin
 
 ---
 
+## Remote shell access (Tailscale SSH)
+
+The `tailscale` **container** runs in userspace mode and only does `tailscale serve` (HTTPS proxy to the apps) + the M365 funnel — it has **no route into the host and cannot give you a shell**. For remote shell, put the **host OS** on the tailnet and use **Tailscale SSH**. No public SSH port, no `0.0.0.0` — access is gated by tailnet identity + ACLs, consistent with the security model above. This adds a second tailnet node (the host), separate from the app-serving container node; give them different hostnames.
+
+```bash
+# On the Ubuntu host — install Tailscale natively (separate from the container):
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# Bring the HOST up with SSH enabled, a distinct hostname, and a server tag.
+# Use a reusable, non-ephemeral auth key, or omit --authkey to log in via browser.
+sudo tailscale up --ssh --hostname=cucoon-host --advertise-tags=tag:server --accept-dns=true
+tailscale status            # confirm the host node is up
+```
+
+In the Tailscale admin console → **Access Controls**, allow SSH to the tagged host:
+
+```jsonc
+{
+  "tagOwners": { "tag:server": ["autogroup:admin"] },
+  "ssh": [
+    {
+      "action": "check",                  // "accept" = no re-auth; "check" = periodic re-auth
+      "src":    ["autogroup:member"],     // who may connect
+      "dst":    ["tag:server"],           // the host node
+      "users":  ["autogroup:nonroot", "root"]
+    }
+  ]
+}
+```
+
+Connect from any tailnet device (Tailscale handles auth — no SSH keys to manage):
+
+```bash
+ssh sganesh@cucoon-host       # MagicDNS name (or: ssh sganesh@100.x.y.z)
+```
+
+Then optionally restrict `:22` to the tailnet only:
+
+```bash
+sudo ufw allow in on tailscale0 to any port 22 proto tcp
+sudo ufw deny 22/tcp          # block public :22
+```
+
+> This is host-level OS config — **independent of the compose stack** (no container changes). Don't enable `--ssh` on the container node; userspace mode won't honor it usefully.
+
+---
+
 ## Documentation
 
 - **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — specification, architecture, block diagram, phased implementation plan, design decisions.
