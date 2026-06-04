@@ -23,10 +23,10 @@ relying on the corresponding service (see brief §9).
 | # | Where | What to verify |
 |---|---|---|
 | 1 | `docker-compose.yml` vllm | `vllm serve` is the modern CLI; older image tags use `python -m vllm.entrypoints.openai.api_server`. Confirm the FP8 checkpoint name `RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8` still resolves on HF. |
-| 2 | `docker-compose.yml` chromadb | Heartbeat path: Chroma 1.x = `/api/v2/heartbeat`; pinning an older 0.5.x image needs `/api/v1/heartbeat`. |
+| 2 | `docker-compose.yml` chromadb | **RESOLVED:** `/api/v2/heartbeat` is correct (`v1` → `410 Gone`). The image ships **no python/curl/wget**, so the python healthcheck never passed → container stuck "unhealthy" though the server was fine. Healthcheck rewritten to a bash `/dev/tcp` HTTP GET asserting `200 OK` (invoked via `CMD bash -c`, since `/bin/sh` is dash). |
 | 3 | `docker-compose.yml` embeddings | Infinity v2 CLI flags (`v2 --model-id … --device cpu`). |
-| 4 | `docker-compose.knowledgebase.yml` wiki-viewer | Exact `./llmwiki serve` flags — check `./llmwiki serve --help` for the checkout. |
-| 5 | `docker-compose.repo.yml` mcp-bitbucket | Bitbucket **Cloud** MCP env names + endpoint path (`http://mcp-bitbucket:8080`?) vs image README. Note: scoped ATATT token (App Passwords deprecated 06/2026). |
+| 4 | `docker-compose.knowledgebase.yml` wiki-viewer | **PARTIALLY RESOLVED:** `llmwiki serve <workspace>` takes only a positional path (no `--host/--port`) and needs `llmwiki init` first — command fixed to `init || true; serve`. It launches API on `0.0.0.0:8000` + web on `:3000`. **Also fixed `librarian/Dockerfile`:** api deps were installed into a venv but `serve` calls `sys.executable -m uvicorn` (system python) → `No module named uvicorn`; now installed into system python. **Requires `docker compose build wiki-viewer` to take effect** (not yet rebuilt here). |
+| 5 | `docker-compose.repo.yml` mcp-bitbucket | **OPEN — needs a decision.** `ghcr.io/ibrahimogod/bitbucket-mcp` `CMD` is a compiled **stdio-only** binary (`/app/bitbucket_mcp`); it has no HTTP/SSE mode and exits immediately ("expect initialize request" / `UnexpectedEof`) with no client attached, so it crash-loops as a standalone sidecar. To run it as a network MCP it needs a stdio→SSE bridge (the `supergateway` pattern used by `mcp-github`'s Dockerfile). Fix only if you use Bitbucket. |
 | 6 | `docker-compose.collab.yml` mcp-slack | Token scheme — XOXP bot token vs browser XOXC/XOXD; env names changed across versions. Reference `@modelcontextprotocol/server-slack` is archived. |
 | 7 | `docker-compose.m365.yml` mcp-m365 | **RESOLVED:** Softeria publishes **no** ghcr image (`ghcr.io/softeria/ms-365-mcp-server` → `denied`); it ships as npm `@softeria/ms-365-mcp-server`. Now run via `npx` on `node:22-bookworm-slim`, pinned `@0.114.0`, npm cache persisted at `${DATA_ROOT}/m365-mcp-npm`. Verified env names `MS365_MCP_TENANT_ID/CLIENT_ID/CLIENT_SECRET`, `--http 8000` (MCP at `/mcp`), `--org-mode`, `--read-only`. **Open:** the README documents delegated/device-code auth; true app-only (client-credentials) Graph access may require the companion `okapi-ca/ms-365-admin-mcp-server` — confirm app-only works for your tenant. Bump the version pin as upstream releases. |
 | 8 | `docker-compose.ticketing.yml` mcp-jira | `sooperset/mcp-atlassian` Jira-only scoping (omit Confluence creds) + read-only flag; Cloud API token vs Server/DC PAT env names. |
@@ -39,6 +39,12 @@ relying on the corresponding service (see brief §9).
 ## Required one-time host setup
 
 - **Create the shared network before the first `up`:** `docker network create ai-internal`. The overlays declare it `external: true`, and in the merged standard set that wins over the base's bridge definition, so Compose will **not** auto-create it — `docker compose up -d` fails with *"network ai-internal declared as external, but could not be found"* until it exists. The network persists across reboots; only recreate it if explicitly removed. (Documented in README §3.)
+
+## First-boot runtime findings (dev host: WSL2, RTX 4050 Laptop 6 GB)
+
+- **postgres** init script never ran on first boot: it was mode `0600` (unreadable by the postgres uid) → "Permission denied", and the data dir was then non-empty so init was skipped. Fixed file modes to `0644` for all bind-mounted config (`init-databases.sh`, `mcp-readonly.sql`, `searxng/settings.yml`, `tailscale/serve.json`, `hermes/config.yaml`) and created the `odysseus`/`postiz` DBs + roles manually against the live cluster. (Git only stores the exec bit, so a fresh `git clone` checks these out `0644` — this was a local working-tree artifact.)
+- **vllm** loads on the 6 GB laptop GPU but will not fit the default 8B-FP8 model at 64k context — needs the target **RTX 4000 Ada 20 GB** host. The `VLLM_*` "Unknown environment variable" warnings are benign (passed as env so the shell command expands them into CLI flags).
+- **Credential-gated (not bugs)** — these crash-loop until real secrets are in `.env`: `mcp-slack` (`SLACK_BOT_TOKEN` xoxp → `invalid_auth`), `beszel-agent` (`BESZEL_KEY`, generated by the Beszel hub UI on first run).
 
 ## Non-issues (checked, intentional)
 

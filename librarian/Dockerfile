@@ -16,7 +16,9 @@ RUN apt-get update \
 WORKDIR /opt
 RUN git clone https://github.com/lucasastorian/llmwiki.git
 WORKDIR /opt/llmwiki
-RUN cd api && python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt \
+# Install the API deps into the SYSTEM python: `llmwiki serve` launches uvicorn
+# via sys.executable (the system interpreter), so a venv here is invisible to it.
+RUN cd api && pip install --no-cache-dir -r requirements.txt \
     && cd ../web && npm install
 # `./llmwiki init <folder>` builds the SQLite index; `serve` runs the UI.
 

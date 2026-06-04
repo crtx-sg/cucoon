@@ -32,9 +32,10 @@ services:
     volumes:
       - ${DATA_ROOT}/vault:/data/vault
     working_dir: /opt/llmwiki
-    # Serves the indexed/compiled vault UI. Verify the exact flag against
-    # `./llmwiki serve --help` for your checkout.
-    command: ["bash", "-lc", "./llmwiki serve /data/vault --host 0.0.0.0 --port 3000"]
+    # `llmwiki serve <workspace>` takes only a positional path (no --host/--port);
+    # it launches the API on 0.0.0.0:8000 and the web UI on :3000. The workspace
+    # must be initialized first (idempotent), else serve exits "not initialized".
+    command: ["bash", "-lc", "./llmwiki init /data/vault 2>/dev/null || true; exec ./llmwiki serve /data/vault"]
     deploy:
       resources:
         limits:
